@@ -25,13 +25,18 @@ from tkinter import filedialog, messagebox, ttk
 import jsonstore
 import player
 
-# 缩略图在网格里的显示宽度
+# 缩略图在网格里的显示尺寸（固定框，保持比例 + 黑边居中，便于虚拟化定位）
 THUMB_W = 200
-CARD_W = THUMB_W + 24
-# 每批渲染多少张卡片（分批渲染，避免大目录卡住界面）
-BATCH = 24
-# PhotoImage 缓存上限。缩略图统一预存在 json 同级的 *_thumb/ 子目录，
-# 单张约 200KB；本机 64G 内存，按 5000 张 ≈ 1GB 估算完全够用，故放宽到 5000。
+THUMB_H = 150
+CARD_W = THUMB_W + 24          # 卡片宽度（含左右内边距/间距）
+CARD_H = THUMB_H + 64          # 卡片固定高度（图片区 + 三行文字 + 内边距）
+# 滚动时向上下各预装载多少「行」的缩略图（参考 Chrome：多缓冲几屏，滚动无拖尾）
+PRELOAD_ROWS = 8
+# 每次空闲 tick 解码几张缩略图，避免一次性解码卡住界面
+DECODE_PER_TICK = 3
+# PhotoImage 内存缓存上限。窗口化渲染只保留「可见区+缓冲」的卡片 widget，
+# 故实际 widget 数量远小于电影数；解码后的图常驻内存缓存，回滚不重解码。
+# 缩略图单张约 200KB，5000 张 ≈ 1GB，本机 64G 内存绰绰有余。
 CACHE_MAX = 5000
 
 
@@ -42,11 +47,16 @@ class BrowseTab(object):
         self.json_path = None
         self.doc = None
         self._node_rel = {}        # tree iid -> rel_dir
-        self._photo_cache = {}     # 缩略图绝对路径 -> PhotoImage
+        self._photo_cache = {}     # 缩略图绝对路径 -> PhotoImage（内存缓存，预装载核心）
         self._cache_order = []
-        self._render_queue = []
-        self._render_idx = 0
-        self._rendering = False
+        self._render_list = []     # 当前视图（含搜索过滤）的全部电影
+        self._cols = 1
+        self._cards = {}           # 电影下标 -> 卡片 widget（仅「可见区+缓冲」）
+        self._card_img = {}        # 电影下标 -> 缩略图 Label（解码完成后回填）
+        self._decode_queue = []    # 待解码的电影下标队列（空闲 tick 消费）
+        self._decode_set = set()
+        self._preload_pending = False
+        self._sync_pending = False
         self._render_token = 0
         self._build()
 
@@ -110,10 +120,10 @@ class BrowseTab(object):
         right.rowconfigure(0, weight=1)
         right.columnconfigure(0, weight=1)
         self.canvas = tk.Canvas(right, highlightthickness=0)
-        vsb = ttk.Scrollbar(right, command=self.canvas.yview)
-        self.canvas.configure(yscrollcommand=vsb.set)
+        self.vsb = ttk.Scrollbar(right, command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self._on_y_scroll)
         self.canvas.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
+        self.vsb.grid(row=0, column=1, sticky="ns")
         self.inner = ttk.Frame(self.canvas)
         self._win = self.canvas.create_window((0, 0), window=self.inner,
                                               anchor="nw")
@@ -223,43 +233,48 @@ class BrowseTab(object):
             out.append(m)
         return out
 
+    # ------------------------------------------------------- 网格渲染（窗口化 + 预装载）
+    #
+    # 设计要点（参考浏览器图片网格的「预装载」思路）：
+    #   * 不因目录里有多少部电影就一次性创建几千个卡片——那会让 Tk 在滚动时
+    #     反复重绘海量子窗口，非常卡。改为「窗口化」：只创建【可见区域 + 上下
+    #     各 PRELOAD_ROWS 行】的卡片 widget，滚动时动态创建/销毁。
+    #   * 缩略图的「解码（读盘 + PIL + 生成 PhotoImage）」很贵，尤其 *_thumb/
+    #     在 network 盘上。于是在空闲时把【接下来几屏】的图片先解码进内存缓存
+    #     （self._photo_cache），卡片一旦进入可见区，只是把缓存里的 PhotoImage
+    #     直接贴上去，零延迟 -> 滚动丝滑、无拖尾。
+
     def _render_current(self):
         movies = self._current_movies()
         self._render_token += 1
-        token = self._render_token
-        self._rendering = False
-        for w in self.inner.winfo_children():
-            w.destroy()
-        self._render_queue = movies
-        self._render_idx = 0
-        self._rendering = True
+        # 清掉旧卡片 widget / 解码队列（含空目录时的占位 Label）
+        for w in list(self.inner.winfo_children()):
+            try:
+                w.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+        self._cards = {}
+        self._card_img = {}
+        self._decode_queue = []
+        self._decode_set = set()
+        self._preload_pending = False
+
+        self._render_list = movies
+        self._cols = self._compute_cols()
+        self._layout()
 
         n = len(movies)
         rel = self._selected_rel() or "（根目录）"
         self.hint_var.set("%s　共 %d 部电影　（左键播放，右键菜单）"
                           % (rel, n))
+        self.canvas.yview_moveto(0)
         if n == 0:
-            self._rendering = False
             ttk.Label(self.inner, text="（该目录下没有电影）",
                       foreground="#888", padding=20).grid(row=0, column=0)
             return
-        self._render_batch(token)
-
-    def _render_batch(self, token):
-        if not self._rendering or token != self._render_token:
-            return
-        cols = self._compute_cols()
-        for _ in range(BATCH):
-            if self._render_idx >= len(self._render_queue):
-                self._rendering = False
-                break
-            m = self._render_queue[self._render_idx]
-            self._add_card(m, self._render_idx, cols)
-            self._render_idx += 1
-        self.inner.update_idletasks()
-        self._on_inner_configure()
-        if self._rendering:
-            self.frame.after(10, lambda: self._render_batch(token))
+        # 立即铺好首屏，并启动「预装载接下来几屏」
+        self._sync_viewport()
+        self._schedule_preload()
 
     def _compute_cols(self):
         w = self.canvas.winfo_width()
@@ -267,32 +282,93 @@ class BrowseTab(object):
             w = self.frame.winfo_width() or 1000
         return max(1, max(240, w - 20) // CARD_W)
 
-    def _add_card(self, movie, idx, cols):
-        r, c = divmod(idx, cols)
-        card = ttk.Frame(self.inner, padding=4, relief="ridge")
-        card.grid(row=r, column=c, padx=6, pady=6, sticky="n")
-        for i in range(cols):
-            self.inner.columnconfigure(i, weight=1)
+    def _layout(self):
+        """按当前列数与电影总数，设定 inner 尺寸与 canvas 滚动范围。"""
+        cols = self._cols
+        total = len(self._render_list)
+        rows = (total + cols - 1) // cols if cols else 0
+        W = cols * CARD_W
+        H = rows * CARD_H
+        self.inner.configure(width=max(W, 1), height=max(H, 1))
+        self.canvas.configure(scrollregion=(0, 0, max(W, 1), max(H, 1)))
 
-        photo = self._load_thumb(movie)
+    def _sync_viewport(self):
+        """按当前滚动位置，只保留可见区±缓冲行的卡片，并预装载这些行的缩略图。
+
+        这是「窗口化 + 预装载」的核心：滚动时反复调用它，卡片 widget 数量
+        始终保持在几十个（可见行 + 上下 PRELOAD_ROWS 行），远小于电影总数，
+        因此 Tk 重绘开销恒定、滚动丝滑；窗口内的缩略图则被加入内存解码队列，
+        解码完成后直接回填，不阻塞滚动。
+        """
+        if not self._render_list or self._cols <= 0:
+            return
+        cols = self._cols
+        total = len(self._render_list)
+        rows_total = (total + cols - 1) // cols
+        top = self.canvas.canvasy(0)
+        vh = self.canvas.winfo_height()
+        if vh <= 1:
+            vh = self.frame.winfo_height() or 800
+        first_row = max(0, int(top) // CARD_H)
+        last_row = min(rows_total - 1, int(top + vh) // CARD_H)
+        pf = max(0, first_row - PRELOAD_ROWS)
+        pl = min(rows_total - 1, last_row + PRELOAD_ROWS)
+        first_idx = pf * cols
+        last_idx = min(total - 1, (pl + 1) * cols - 1)
+
+        need = set(range(first_idx, last_idx + 1))
+        # 创建缺失的卡片
+        for i in need:
+            if i not in self._cards:
+                self._make_card(i, cols)
+        # 销毁窗口外的卡片（对应 PhotoImage 仍在内存缓存，回滚不重解码）
+        for i in list(self._cards.keys()):
+            if i not in need:
+                try:
+                    self._cards[i].destroy()
+                except Exception:  # noqa: BLE001
+                    pass
+                del self._cards[i]
+                self._card_img.pop(i, None)
+        # 把窗口内的缩略图加入预装载队列
+        self._enqueue_range(first_idx, last_idx)
+        self._schedule_preload()
+
+    def _make_card(self, i, cols):
+        """创建第 i 部电影的卡片（仅当它在「可见区 + 缓冲」窗口内才被调用）。
+
+        卡片用绝对坐标 place 到 inner 上（行*CARD_H，列*CARD_W），因此无论
+        列表多大都只有窗口内的几十张卡片 widget，滚动时随视口动态增删。
+        """
+        m = self._render_list[i]
+        r, c = divmod(i, cols)
+        x = c * CARD_W
+        y = r * CARD_H
+        card = ttk.Frame(self.inner, padding=4, relief="ridge")
+        card.place(x=x, y=y, width=CARD_W, height=CARD_H)
+
         lbl_img = ttk.Label(card)
+        photo = self._thumb_cache_get(m)
         if photo is not None:
+            # 命中内存缓存 -> 直接贴，零延迟
             lbl_img.configure(image=photo)
-            lbl_img.image = photo       # 防止被 GC
+            lbl_img.image = photo
         else:
-            lbl_img.configure(text="（无缩略图）", width=24,
-                              anchor="center", foreground="#999")
+            # 还没解码：先放占位，加入预装载队列，解码完成后回填
+            lbl_img.configure(text="（载入中）", width=24,
+                              anchor="center", foreground="#bbb")
             lbl_img.configure(relief="groove", padding=(0, 40))
+            self._enqueue_one(i)
         lbl_img.pack()
 
-        name = jsonstore.movie_name(movie)
+        name = jsonstore.movie_name(m)
         show = name if len(name) <= 26 else name[:25] + "…"
         lbl_name = ttk.Label(card, text=show, wraplength=THUMB_W,
                              justify="center", font=("TkDefaultFont", 10, "bold"))
         lbl_name.pack(pady=(4, 0))
 
         # 视频文件名（取相对路径里的文件名）
-        fname = os.path.basename(movie.get("file") or "")
+        fname = os.path.basename(m.get("file") or "")
         fshow = fname if len(fname) <= 34 else fname[:33] + "…"
         lbl_file = ttk.Label(card, text=fshow, wraplength=THUMB_W,
                              justify="center", foreground="#555",
@@ -300,14 +376,17 @@ class BrowseTab(object):
         lbl_file.pack(pady=(2, 0))
 
         # 视频文件大小
-        sz = self._fmt_size(movie.get("size") or 0)
+        sz = self._fmt_size(m.get("size") or 0)
         lbl_size = ttk.Label(card, text=sz, justify="center",
                              foreground="#888", font=("TkDefaultFont", 9))
         lbl_size.pack(pady=(1, 0))
 
+        self._cards[i] = card
+        self._card_img[i] = lbl_img
+
         for w in (card, lbl_img, lbl_name, lbl_file, lbl_size):
-            w.bind("<Button-1>", lambda e, m=movie: self._on_play(m))
-            w.bind("<Button-3>", lambda e, m=movie: self._show_menu(e, m))
+            w.bind("<Button-1>", lambda e, m=m: self._on_play(m))
+            w.bind("<Button-3>", lambda e, m=m: self._show_menu(e, m))
             try:
                 w.configure(cursor="hand2")
             except Exception:  # noqa: BLE001
@@ -331,46 +410,117 @@ class BrowseTab(object):
             size /= 1024.0
         return "%.1f TB" % size
 
-    def _load_thumb(self, movie):
-        """把缩略图解码成 tk.PhotoImage（带缓存）。
+    # ---- 缩略图解码 + 内存缓存（预装载核心）----
 
-        优先读 json 同级的 ``*_thumb/`` 缓存副本（扫描时已生成，
-        避免每次刷界面去读可能在网络盘上的视频目录）；
-        没有缓存副本（旧 json / 缺图）时回退到视频同目录的源缩略图。
-        走 PIL → PNG bytes → PhotoImage(data=…)，绕开 ImageTk DLL。
+    def _resolved_thumb_path(self, movie):
+        """该电影实际要用的缩略图文件：优先 json 同级的 *_thumb/ 副本，
+        其次（兼容旧 json）回退到视频同目录的源缩略图。无则返回 None。
         """
-        path = self._thumb_path(movie)
-        if not path or not os.path.isfile(path):
-            # 兼容旧 json：回退到视频同目录的源缩略图
-            src = jsonstore.movie_abs_thumb(self.doc, movie)
-            if src and os.path.isfile(src):
-                path = src
-        if not path:
+        p = self._thumb_path(movie)
+        if p and os.path.isfile(p):
+            return p
+        s = jsonstore.movie_abs_thumb(self.doc, movie)
+        if s and os.path.isfile(s):
+            return s
+        return None
+
+    def _thumb_cache_get(self, movie):
+        """仅查内存缓存（不解码）。命中返回 PhotoImage，否则 None。"""
+        p = self._resolved_thumb_path(movie)
+        if not p:
             return None
-        key = os.path.normcase(path)
-        if key in self._photo_cache:
-            return self._photo_cache[key]
-        try:
-            from PIL import Image
-            with Image.open(path) as im:
-                im = im.convert("RGB")
-                w, h = im.size
-                if w <= 0 or h <= 0:
-                    return None
-                th = max(1, int(h * THUMB_W / w))
-                im = im.resize((THUMB_W, th))
-                buf = io.BytesIO()
-                im.save(buf, format="PNG")
-            photo = tk.PhotoImage(data=base64.b64encode(buf.getvalue()))
-        except Exception:  # noqa: BLE001
-            return None
-        # 简易 LRU
+        return self._photo_cache.get(os.path.normcase(p))
+
+    def _thumb_cache_put(self, movie, photo):
+        """写入内存缓存（带 LRU 上限）。"""
+        p = self._resolved_thumb_path(movie)
+        if not p:
+            return
+        key = os.path.normcase(p)
         self._photo_cache[key] = photo
         self._cache_order.append(key)
         while len(self._cache_order) > CACHE_MAX:
             old = self._cache_order.pop(0)
             self._photo_cache.pop(old, None)
-        return photo
+
+    def _thumb_decode(self, movie):
+        """同步把一张缩略图解码成 tk.PhotoImage。
+
+        保持比例缩放进固定框 (THUMB_W×THUMB_H)、黑边居中；走
+        PIL → PNG bytes → PhotoImage(data=…)，绕开本机拦截的 ImageTk DLL。
+        返回 PhotoImage 或 None（无图/解码失败）。
+        """
+        p = self._resolved_thumb_path(movie)
+        if not p:
+            return None
+        try:
+            from PIL import Image
+            with Image.open(p) as im:
+                im = im.convert("RGB")
+                w, h = im.size
+                if w <= 0 or h <= 0:
+                    return None
+                scale = min(THUMB_W / w, THUMB_H / h)
+                nw = max(1, int(w * scale))
+                nh = max(1, int(h * scale))
+                im = im.resize((nw, nh))
+                bg = Image.new("RGB", (THUMB_W, THUMB_H), (0, 0, 0))
+                bg.paste(im, ((THUMB_W - nw) // 2, (THUMB_H - nh) // 2))
+                buf = io.BytesIO()
+                bg.save(buf, format="PNG")
+            return tk.PhotoImage(data=base64.b64encode(buf.getvalue()))
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _enqueue_one(self, i):
+        """把第 i 部电影加入待解码队列（已缓存/已在队里则跳过）。"""
+        if i < 0 or i >= len(self._render_list):
+            return
+        m = self._render_list[i]
+        if self._thumb_cache_get(m) is not None:
+            return
+        if i in self._decode_set:
+            return
+        self._decode_queue.append(i)
+        self._decode_set.add(i)
+
+    def _enqueue_range(self, first_idx, last_idx):
+        for i in range(first_idx, last_idx + 1):
+            self._enqueue_one(i)
+
+    def _schedule_preload(self):
+        """安排一次空闲解码 tick（合并连续调用，避免重复排程）。"""
+        if self._preload_pending:
+            return
+        self._preload_pending = True
+        self.frame.after_idle(self._preload_tick)
+
+    def _preload_tick(self):
+        """空闲时解码几张缩略图进内存缓存；解码完若卡片还在可见窗口则回填。
+
+        每次只解 DECODE_PER_TICK 张，之后用 after_idle 续解，确保解码过程
+        不阻塞主线程、滚动依旧丝滑。
+        """
+        self._preload_pending = False
+        done = 0
+        while self._decode_queue and done < DECODE_PER_TICK:
+            i = self._decode_queue.pop(0)
+            self._decode_set.discard(i)
+            if i >= len(self._render_list):
+                continue
+            m = self._render_list[i]
+            if self._thumb_cache_get(m) is not None:
+                continue
+            photo = self._thumb_decode(m)
+            if photo is not None:
+                self._thumb_cache_put(m, photo)
+                lbl = self._card_img.get(i)
+                if lbl is not None and lbl.winfo_exists():
+                    lbl.configure(image=photo)
+                    lbl.image = photo
+            done += 1
+        if self._decode_queue:
+            self._schedule_preload()
 
     def _thumb_path(self, movie):
         """该电影在 *_thumb/ 缓存子目录里的缩略图绝对路径（无则 None）。"""
@@ -392,25 +542,58 @@ class BrowseTab(object):
     # ------------------------------------------------------- 滚动
 
     def _on_inner_configure(self, _event=None):
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        # inner 尺寸已由 _layout 显式设定，这里顺手刷新 scrollregion
+        self.canvas.configure(scrollregion=(0, 0,
+                              self.inner.winfo_width(), self.inner.winfo_height()))
+
+    def _on_y_scroll(self, *args):
+        # 滚动条位置变化 -> 更新滚动条 widget，并安排一次视口同步
+        self.vsb.set(*args)
+        self._schedule_sync()
+
+    def _schedule_sync(self):
+        # 用 after_idle 合并连续滚动事件，避免每像素都重建卡片
+        if self._sync_pending:
+            return
+        self._sync_pending = True
+        self.frame.after_idle(self._do_sync)
+
+    def _do_sync(self):
+        self._sync_pending = False
+        self._sync_viewport()
+
+    _sync_pending = False
 
     def _on_canvas_configure(self, event=None):
         self.canvas.itemconfigure(self._win, width=self.canvas.winfo_width())
-        self._on_inner_configure()
-        # 窗口宽度变化时重排（节流：停止拖动后再排）
+        # 窗口宽度变化 -> 列数可能变 -> 重排可见卡片（节流：停顿后再排，
+        # 避免拖动分隔条时每像素都重建 widget）
         if self._resize_job:
             try:
                 self.frame.after_cancel(self._resize_job)
             except Exception:  # noqa: BLE001
                 pass
-        self._resize_job = self.frame.after(250, self._rerender_keep_pos)
+        self._resize_job = self.frame.after(200, self._relayout)
+
+    def _relayout(self):
+        self._resize_job = None
+        if not self._render_list:
+            return
+        new_cols = self._compute_cols()
+        if new_cols != self._cols:
+            self._cols = new_cols
+            # 旧卡片坐标失效，全清后由 _sync_viewport 按新列重建
+            for w in self._cards.values():
+                try:
+                    w.destroy()
+                except Exception:  # noqa: BLE001
+                    pass
+            self._cards = {}
+            self._card_img = {}
+        self._layout()
+        self._sync_viewport()
 
     _resize_job = None
-
-    def _rerender_keep_pos(self):
-        self._resize_job = None
-        if self.doc and not self._rendering:
-            self._render_current()
 
     def _bind_mousewheel(self):
         def on_mousewheel(event):
