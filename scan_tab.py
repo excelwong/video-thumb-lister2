@@ -33,7 +33,10 @@ class ScanTab(object):
         self.busy = False
         self.cancel_event = threading.Event()
         self.last_json_path = None
+        self._json_auto = True        # 当前 json 路径是否为「自动生成」（未被用户手改）
+        self._suppress_trace = False  # 程序化 set 时临时抑制 trace，避免误判为手改
         self._build()
+        self.json_var.trace_add("write", self._on_json_edit)
         self._poll()
 
     # ---------------------------------------------------------------- UI
@@ -136,14 +139,29 @@ class ScanTab(object):
         else:
             self.json_btn.configure(text="选择…")
 
+    def _on_json_edit(self, *args):
+        """JSON 路径输入框被改动时（用户手改），标记为非自动生成。"""
+        if self._suppress_trace:
+            return
+        self._json_auto = False
+
     def _pick_dir(self):
         d = filedialog.askdirectory(title="选择要扫描的目录")
         if d:
             self.dir_var.set(d)
-            # 新建模式下，按扫描目录自动推导默认 json 路径：
-            # <项目>/output/gallery_{序号}_{末级目录名}.json
-            if self.mode_var.get() == "new" and not self.json_var.get().strip():
-                self.json_var.set(jsonstore.gallery_json_path(d))
+            # 新建模式下，按【当前】扫描目录自动推导默认 json 路径。
+            # 关键：只要当前 json 路径是「自动生成的」或字段为空，就跟随新目录重算，
+            # 否则上一次选的目录名会残留在 json 文件名里
+            # （例如先选 X:/中文字幕 又改选 X:/有码，却仍生成 gallery_X_中文字幕.json）。
+            # 用户手动编辑过 json 路径则保留其选择，不被目录切换覆盖。
+            if self.mode_var.get() == "new" and (
+                    self._json_auto or not self.json_var.get().strip()):
+                self._suppress_trace = True
+                try:
+                    self.json_var.set(jsonstore.gallery_json_path(d))
+                finally:
+                    self._suppress_trace = False
+                self._json_auto = True
 
     def _pick_json(self):
         if self.mode_var.get() == "new":
