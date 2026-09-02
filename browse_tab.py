@@ -351,13 +351,13 @@ class BrowseTab(object):
         photo = self._thumb_cache_get(m)
         if photo is not None:
             # 命中内存缓存 -> 直接贴，零延迟
-            lbl_img.configure(image=photo)
-            lbl_img.image = photo
+            self._apply_thumb(lbl_img, photo)
         else:
-            # 还没解码：先放占位，加入预装载队列，解码完成后回填
-            lbl_img.configure(text="（载入中）", width=24,
-                              anchor="center", foreground="#bbb")
-            lbl_img.configure(relief="groove", padding=(0, 40))
+            # 还没解码：先放占位，加入预装载队列，解码完成后回填。
+            # 注意：占位态绝不设 padding/relief——否则解码回填时若只换 image
+            # 不清除，占位 label 会被撑高，把下方的电影名/文件名/大小挤出卡片。
+            lbl_img.configure(text="（载入中）", anchor="center",
+                              foreground="#bbb")
             self._enqueue_one(i)
         lbl_img.pack()
 
@@ -391,6 +391,17 @@ class BrowseTab(object):
                 w.configure(cursor="hand2")
             except Exception:  # noqa: BLE001
                 pass
+
+    def _apply_thumb(self, lbl, photo):
+        """把解码好的缩略图贴到 label 上，并清除占位态的 padding/relief/文本。
+
+        关键修复：先前占位 label 用了 padding=(0,40)/relief=groove，解码回填时
+        若只换 image 不清这些属性，label 会被撑高到 ~230px，把下方的电影名/
+        文件名/大小三行文字挤出卡片（被下一行卡片遮住）——表现为「大片缩略图
+        下方没有文字」。这里统一清除，保证 label 高度恒为缩略图高度。
+        """
+        lbl.configure(text="", image=photo, relief="flat", padding=0, width=0)
+        lbl.image = photo
 
     @staticmethod
     def _fmt_size(size):
@@ -516,8 +527,7 @@ class BrowseTab(object):
                 self._thumb_cache_put(m, photo)
                 lbl = self._card_img.get(i)
                 if lbl is not None and lbl.winfo_exists():
-                    lbl.configure(image=photo)
-                    lbl.image = photo
+                    self._apply_thumb(lbl, photo)
             done += 1
         if self._decode_queue:
             self._schedule_preload()
