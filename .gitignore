@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+*.pyo
+*.py[cod]
+
+# 生成的缩略图（散落在视频目录里，不入库）
+*.thumb.jpg
+*.thumb.webp
+
+# 扫描产物 / 临时文件
+output/
+dist/
+build/
+.DS_Store
+
+.vscode/
+.idea/
+*.swp
