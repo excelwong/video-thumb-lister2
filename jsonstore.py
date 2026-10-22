@@ -48,6 +48,7 @@ import hashlib
 import json
 import os
 import re
+import sys
 
 VERSION = "2.0"
 
@@ -56,7 +57,11 @@ DIRS = "dirs"
 FILES = "files"
 
 # 输出目录：<项目根>/output/，所有 json 与缩略图缓存都落在这里
-PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, "frozen", False):
+    # PyInstaller 单文件打包：__file__ 在临时解压目录，输出要落到 exe 真实所在目录
+    PROJECT_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(PROJECT_DIR, "output")
 
 # 文件名里不能出现的字符（Windows + POSIX 取交集）
